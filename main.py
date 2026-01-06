@@ -27,7 +27,7 @@ import re, os, requests
 
 logger = logging.getLogger(__name__)
 
-ENABLE_LOGGING=True
+ENABLE_LOGGING=False
 LOGGING_DIR="/Users/sahil/Desktop/data/metaculus/minibench_live"
 
 
@@ -193,7 +193,7 @@ class FallTemplateBot2025(ForecastBot):
             if ENABLE_LOGGING:
                 with open(prediction_filename, 'w') as f:
                     f.write(prediction_response)
-                    
+
         logger.info(f"Reasoning for URL {question.page_url}: {prediction_response}")
         binary_prediction: BinaryPrediction = await structure_output(
             prediction_response, BinaryPrediction, model=self.get_llm("parser", "llm")
