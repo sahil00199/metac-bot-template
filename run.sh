@@ -1,0 +1,7 @@
+# METACULUS_TOKEN="fe049bf8f345883b5a985d19256efbf122542d75" \
+#     OPENROUTER_API_KEY="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" \
+#     ASKNEWS_CLIENT_ID="bd5fb7a5-6216-4254-8c89-a31b27eb6535" \
+#     ASKNEWS_SECRET="ank_LbWu4vsr1NlZvf7LvycGjfyMj1O85DO58jhz1ZvNDk" \
+#     poetry run python main.py --mode test_questions
+
+METACULUS_TOKEN="fe049bf8f345883b5a985d19256efbf122542d75" OPENROUTER_API_KEY="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" ASKNEWS_CLIENT_ID="67cc0120-382f-453a-af87-10ff67dea381" ASKNEWS_SECRET="Zuv9qhVvGLtXc-cZZYK~Uy5hYb" poetry run python main.py --mode test_questions

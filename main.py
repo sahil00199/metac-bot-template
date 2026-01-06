@@ -3,6 +3,7 @@ import asyncio
 import logging
 from datetime import datetime
 from typing import Literal
+import prompts
 
 from forecasting_tools import (
     AskNewsSearcher,
@@ -22,8 +23,12 @@ from forecasting_tools import (
     clean_indents,
     structure_output,
 )
+import re, os, requests
 
 logger = logging.getLogger(__name__)
+
+ENABLE_LOGGING=True
+LOGGING_DIR="/Users/sahil/Desktop/data/metaculus/minibench_live"
 
 
 class FallTemplateBot2025(ForecastBot):
@@ -107,152 +112,113 @@ class FallTemplateBot2025(ForecastBot):
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
 
     async def run_research(self, question: MetaculusQuestion) -> str:
+        # Here, we will first generate the search prompts, then search for each of them and then stitch them together as research
         async with self._concurrency_limiter:
-            research = ""
-            researcher = self.get_llm("researcher")
-
-            prompt = clean_indents(
-                f"""
-                You are an assistant to a superforecaster.
-                The superforecaster will give you a question they intend to forecast on.
-                To be a great assistant, you generate a concise but detailed rundown of the most relevant news, including if the question would resolve Yes or No based on current information.
-                You do not produce forecasts yourself.
-
-                Question:
-                {question.question_text}
-
-                This question's outcome will be determined by the specific criteria below:
-                {question.resolution_criteria}
-
-                {question.fine_print}
-                """
-            )
-
-            if isinstance(researcher, GeneralLlm):
-                research = await researcher.invoke(prompt)
-            elif researcher == "asknews/news-summaries":
-                research = await AskNewsSearcher().get_formatted_news_async(
-                    question.question_text
-                )
-            elif researcher == "asknews/deep-research/medium-depth":
-                research = await AskNewsSearcher().get_formatted_deep_research(
-                    question.question_text,
-                    sources=["asknews", "google"],
-                    search_depth=2,
-                    max_depth=4,
-                )
-            elif researcher == "asknews/deep-research/high-depth":
-                research = await AskNewsSearcher().get_formatted_deep_research(
-                    question.question_text,
-                    sources=["asknews", "google"],
-                    search_depth=4,
-                    max_depth=6,
-                )
-            elif researcher.startswith("smart-searcher"):
-                model_name = researcher.removeprefix("smart-searcher/")
-                searcher = SmartSearcher(
-                    model=model_name,
-                    temperature=0,
-                    num_searches_to_run=2,
-                    num_sites_per_search=10,
-                    use_advanced_filters=False,
-                )
-                research = await searcher.invoke(prompt)
-            elif not researcher or researcher == "None":
-                research = ""
+            # Generate search query prompts
+            search_query_generation_filename = f'{LOGGING_DIR}/search_query_generation/{question.id_of_question}.txt'
+            if ENABLE_LOGGING and os.path.exists(search_query_generation_filename):
+                search_query_generation_response = open(search_query_generation_filename).read()
             else:
-                research = await self.get_llm("researcher", "llm").invoke(prompt)
-            logger.info(f"Found Research for URL {question.page_url}:\n{research}")
+                search_query_generation_prompt = prompts.get_search_query_generation_prompt(question.to_json())
+                llm = GeneralLlm(model="openrouter/openai/o4-mini-high")
+                search_query_generation_response = await llm.invoke(search_query_generation_prompt)
+                if ENABLE_LOGGING:
+                    with open(search_query_generation_filename, 'w') as f:
+                        f.write(search_query_generation_response)
+                
+            search_queries_block = re.search(r'(?:Search queries:)(.*)', search_query_generation_response, re.DOTALL | re.IGNORECASE)
+            assert search_queries_block
+            queries_text = search_queries_block.group(1).strip()
+            current_queries = [question.question_text]
+            for query in queries_text.split('\n'):
+                query = '. '.join(query.split('. ')[1:])
+                if len(query) > 5:
+                    current_queries.append(query)
+
+            # Search on perplexity for these queries
+            research_filename = f'{LOGGING_DIR}/perplexity_search_response/{question.id_of_question}.txt'
+            if ENABLE_LOGGING and os.path.exists(research_filename):
+                research = open(research_filename).read()
+            else:
+                current_responses = []
+                PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY")
+                for search_query in current_queries:
+                    url = "https://api.perplexity.ai/chat/completions"
+                    payload = {
+                        "model": "sonar",
+                        "messages": [
+                            {
+                                "role": "system",
+                                "content": "Be thorough and detailed. Be objective in your analysis, proving documented facts only. Cite all sources with names and dates."
+                            },
+                            {
+                                "role": "user",
+                                "content": search_query + " Cite all sources with names and dates, compiling a list of sources at the end. Be objective in your analysis, providing documented facts only."
+                            }
+                        ]
+                    }
+                    headers = {
+                        "accept": "application/json",
+                        "content-type": "application/json",
+                        "authorization": f"Bearer {PERPLEXITY_API_KEY}"
+                    }
+                    
+                    resp = requests.post(url, json=payload, headers=headers, timeout=800)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    content = data['choices'][0]['message']['content']
+                    content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL)
+                    current_responses.append(content)
+                
+                research = ""
+                for question, answer in zip(current_queries, current_responses):
+                    research += f"<Question>: {question}\n"
+                    research += f"<Answer>: {answer}\n<End of Answer>\n\n"
+                if ENABLE_LOGGING:
+                    with open(research_filename, 'w') as f:
+                        f.write(research)
+
             return research
 
     async def _run_forecast_on_binary(
         self, question: BinaryQuestion, research: str
     ) -> ReasonedPrediction[float]:
-        prompt = clean_indents(
-            f"""
-            You are a professional forecaster interviewing for a job.
-
-            Your interview question is:
-            {question.question_text}
-
-            Question background:
-            {question.background_info}
-
-
-            This question's outcome will be determined by the specific criteria below. These criteria have not yet been satisfied:
-            {question.resolution_criteria}
-
-            {question.fine_print}
-
-
-            Your research assistant says:
-            {research}
-
-            Today is {datetime.now().strftime("%Y-%m-%d")}.
-
-            Before answering you write:
-            (a) The time left until the outcome to the question is known.
-            (b) The status quo outcome if nothing changed.
-            (c) A brief description of a scenario that results in a No outcome.
-            (d) A brief description of a scenario that results in a Yes outcome.
-
-            You write your rationale remembering that good forecasters put extra weight on the status quo outcome since the world changes slowly most of the time.
-
-            The last thing you write is your final answer as: "Probability: ZZ%", 0-100
-            """
-        )
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
-        logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
+        prediction_filename = f"{LOGGING_DIR}/predictions/{question.id_of_question}.txt"
+        if ENABLE_LOGGING and os.path.exists(prediction_filename):
+            prediction_response = open(prediction_filename).read()
+        else:
+            prompt = prompts.get_binary_prompt_with_research(question=question.to_json(), research=research)
+            llm = GeneralLlm(model="openrouter/openai/gpt-5.2")
+            prediction_response = await llm.invoke(prompt)
+            if ENABLE_LOGGING:
+                with open(prediction_filename, 'w') as f:
+                    f.write(prediction_response)
+                    
+        logger.info(f"Reasoning for URL {question.page_url}: {prediction_response}")
         binary_prediction: BinaryPrediction = await structure_output(
-            reasoning, BinaryPrediction, model=self.get_llm("parser", "llm")
+            prediction_response, BinaryPrediction, model=self.get_llm("parser", "llm")
         )
         decimal_pred = max(0.01, min(0.99, binary_prediction.prediction_in_decimal))
 
         logger.info(
             f"Forecasted URL {question.page_url} with prediction: {decimal_pred}"
         )
-        return ReasonedPrediction(prediction_value=decimal_pred, reasoning=reasoning)
+        return ReasonedPrediction(prediction_value=decimal_pred, reasoning=prediction_response)
 
     async def _run_forecast_on_multiple_choice(
         self, question: MultipleChoiceQuestion, research: str
     ) -> ReasonedPrediction[PredictedOptionList]:
-        prompt = clean_indents(
-            f"""
-            You are a professional forecaster interviewing for a job.
+        prediction_filename = f"{LOGGING_DIR}/predictions/{question.id_of_question}.txt"
+        if ENABLE_LOGGING and os.path.exists(prediction_filename):
+            prediction_response = open(prediction_filename).read()
+        else:
+            prompt = prompts.get_multiple_choice_prompt_with_research(question=question.to_json(), research=research)
+            llm = GeneralLlm(model="openrouter/openai/gpt-5.2")
+            prediction_response = await llm.invoke(prompt)
+            if ENABLE_LOGGING:
+                with open(prediction_filename, 'w') as f:
+                    f.write(prediction_response)
 
-            Your interview question is:
-            {question.question_text}
-
-            The options are: {question.options}
-
-
-            Background:
-            {question.background_info}
-
-            {question.resolution_criteria}
-
-            {question.fine_print}
-
-
-            Your research assistant says:
-            {research}
-
-            Today is {datetime.now().strftime("%Y-%m-%d")}.
-
-            Before answering you write:
-            (a) The time left until the outcome to the question is known.
-            (b) The status quo outcome if nothing changed.
-            (c) A description of an scenario that results in an unexpected outcome.
-
-            You write your rationale remembering that (1) good forecasters put extra weight on the status quo outcome since the world changes slowly most of the time, and (2) good forecasters leave some moderate probability on most options to account for unexpected outcomes.
-
-            The last thing you write is your final probabilities for the N options in this order {question.options} as:
-            Option_A: Probability_A
-            Option_B: Probability_B
-            ...
-            Option_N: Probability_N
-            """
-        )
         parsing_instructions = clean_indents(
             f"""
             Make sure that all option names are one of the following:
@@ -260,10 +226,9 @@ class FallTemplateBot2025(ForecastBot):
             The text you are parsing may prepend these options with some variation of "Option" which you should remove if not part of the option names I just gave you.
             """
         )
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
-        logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
+        logger.info(f"Reasoning for URL {question.page_url}: {prediction_response}")
         predicted_option_list: PredictedOptionList = await structure_output(
-            text_to_structure=reasoning,
+            text_to_structure=prediction_response,
             output_type=PredictedOptionList,
             model=self.get_llm("parser", "llm"),
             additional_instructions=parsing_instructions,
@@ -272,103 +237,32 @@ class FallTemplateBot2025(ForecastBot):
             f"Forecasted URL {question.page_url} with prediction: {predicted_option_list}"
         )
         return ReasonedPrediction(
-            prediction_value=predicted_option_list, reasoning=reasoning
+            prediction_value=predicted_option_list, reasoning=prediction_response
         )
 
     async def _run_forecast_on_numeric(
         self, question: NumericQuestion, research: str
     ) -> ReasonedPrediction[NumericDistribution]:
-        upper_bound_message, lower_bound_message = (
-            self._create_upper_and_lower_bound_messages(question)
-        )
-        prompt = clean_indents(
-            f"""
-            You are a professional forecaster interviewing for a job.
+        prediction_filename = f"{LOGGING_DIR}/predictions/{question.id_of_question}.txt"
+        if ENABLE_LOGGING and os.path.exists(prediction_filename):
+            prediction_response = open(prediction_filename).read()
+        else:
+            prompt = prompts.get_multiple_choice_prompt_with_research(question=question.to_json(), research=research)
+            llm = GeneralLlm(model="openrouter/openai/gpt-5.2")
+            prediction_response = await llm.invoke(prompt)
+            if ENABLE_LOGGING:
+                with open(prediction_filename, 'w') as f:
+                    f.write(prediction_response)
 
-            Your interview question is:
-            {question.question_text}
-
-            Background:
-            {question.background_info}
-
-            {question.resolution_criteria}
-
-            {question.fine_print}
-
-            Units for answer: {question.unit_of_measure if question.unit_of_measure else "Not stated (please infer this)"}
-
-            Your research assistant says:
-            {research}
-
-            Today is {datetime.now().strftime("%Y-%m-%d")}.
-
-            {lower_bound_message}
-            {upper_bound_message}
-
-            Formatting Instructions:
-            - Please notice the units requested (e.g. whether you represent a number as 1,000,000 or 1 million).
-            - Never use scientific notation.
-            - Always start with a smaller number (more negative if negative) and then increase from there
-
-            Before answering you write:
-            (a) The time left until the outcome to the question is known.
-            (b) The outcome if nothing changed.
-            (c) The outcome if the current trend continued.
-            (d) The expectations of experts and markets.
-            (e) A brief description of an unexpected scenario that results in a low outcome.
-            (f) A brief description of an unexpected scenario that results in a high outcome.
-
-            You remind yourself that good forecasters are humble and set wide 90/10 confidence intervals to account for unknown unknowns.
-
-            The last thing you write is your final answer as:
-            "
-            Percentile 10: XX
-            Percentile 20: XX
-            Percentile 40: XX
-            Percentile 60: XX
-            Percentile 80: XX
-            Percentile 90: XX
-            "
-            """
-        )
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
-        logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
+        logger.info(f"Reasoning for URL {question.page_url}: {prediction_response}")
         percentile_list: list[Percentile] = await structure_output(
-            reasoning, list[Percentile], model=self.get_llm("parser", "llm")
+            prediction_response, list[Percentile], model=self.get_llm("parser", "llm")
         )
         prediction = NumericDistribution.from_question(percentile_list, question)
         logger.info(
             f"Forecasted URL {question.page_url} with prediction: {prediction.declared_percentiles}"
         )
-        return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
-
-    def _create_upper_and_lower_bound_messages(
-        self, question: NumericQuestion
-    ) -> tuple[str, str]:
-        if question.nominal_upper_bound is not None:
-            upper_bound_number = question.nominal_upper_bound
-        else:
-            upper_bound_number = question.upper_bound
-        if question.nominal_lower_bound is not None:
-            lower_bound_number = question.nominal_lower_bound
-        else:
-            lower_bound_number = question.lower_bound
-
-        if question.open_upper_bound:
-            upper_bound_message = f"The question creator thinks the number is likely not higher than {upper_bound_number}."
-        else:
-            upper_bound_message = (
-                f"The outcome can not be higher than {upper_bound_number}."
-            )
-
-        if question.open_lower_bound:
-            lower_bound_message = f"The question creator thinks the number is likely not lower than {lower_bound_number}."
-        else:
-            lower_bound_message = (
-                f"The outcome can not be lower than {lower_bound_number}."
-            )
-        return upper_bound_message, lower_bound_message
-
+        return ReasonedPrediction(prediction_value=prediction, reasoning=prediction_response)
 
 if __name__ == "__main__":
     logging.basicConfig(
@@ -444,9 +338,9 @@ if __name__ == "__main__":
         # Example questions are a good way to test the bot's performance on a single question
         EXAMPLE_QUESTIONS = [
             "https://www.metaculus.com/questions/578/human-extinction-by-2100/",  # Human Extinction - Binary
-            "https://www.metaculus.com/questions/14333/age-of-oldest-human-as-of-2100/",  # Age of Oldest Human - Numeric
-            "https://www.metaculus.com/questions/22427/number-of-new-leading-ai-labs/",  # Number of New Leading AI Labs - Multiple Choice
-            "https://www.metaculus.com/c/diffusion-community/38880/how-many-us-labor-strikes-due-to-ai-in-2029/",  # Number of US Labor Strikes Due to AI in 2029 - Discrete
+            # "https://www.metaculus.com/questions/14333/age-of-oldest-human-as-of-2100/",  # Age of Oldest Human - Numeric
+            # "https://www.metaculus.com/questions/22427/number-of-new-leading-ai-labs/",  # Number of New Leading AI Labs - Multiple Choice
+            # "https://www.metaculus.com/c/diffusion-community/38880/how-many-us-labor-strikes-due-to-ai-in-2029/",  # Number of US Labor Strikes Due to AI in 2029 - Discrete
         ]
         template_bot.skip_previously_forecasted_questions = False
         questions = [

@@ -129,6 +129,7 @@ celerybeat.pid
 # Environments
 .env
 .venv
+notebooks
 env/
 venv/
 ENV/
