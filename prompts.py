@@ -135,6 +135,7 @@ def get_numeric_prompt_with_research(question, research):
             {{Shortened, brief checklist verification here}}
             
             Distribution:
+            Percentile 0.1: XX
             Percentile 1: XX
             Percentile 5: XX
             Percentile 10: XX
@@ -145,6 +146,7 @@ def get_numeric_prompt_with_research(question, research):
             Percentile 90: XX
             Percentile 95: XX
             Percentile 99: XX
+            Percentile 99.9: XX
             """
         )
     return prompt_with_research
