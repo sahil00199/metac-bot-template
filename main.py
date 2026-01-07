@@ -247,7 +247,7 @@ class FallTemplateBot2025(ForecastBot):
         if ENABLE_LOGGING and os.path.exists(prediction_filename):
             prediction_response = open(prediction_filename).read()
         else:
-            prompt = prompts.get_multiple_choice_prompt_with_research(question=question.to_json(), research=research)
+            prompt = prompts.get_numeric_prompt_with_research(question=question.to_json(), research=research)
             llm = GeneralLlm(model="openrouter/openai/gpt-5.2")
             prediction_response = await llm.invoke(prompt)
             if ENABLE_LOGGING:
